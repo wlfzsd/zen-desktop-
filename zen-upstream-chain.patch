@@ -1,0 +1,1132 @@
+diff --git a/internal/app/app.go b/internal/app/app.go
+index 86e50d5..1a3640b 100644
+--- a/internal/app/app.go
++++ b/internal/app/app.go
+@@ -243,7 +243,7 @@ func (a *App) StartProxy() (err error) {
+ 	}
+ 
+ 	a.systemProxyManager.SetPACPort(a.config.GetPACPort())
+-	if err := a.systemProxyManager.Set(port, a.config.GetIgnoredHosts(), routingPolicy.ShouldProxy); err != nil {
++	if err := a.systemProxyManager.Set(port, a.config.GetIgnoredHosts(), routingPolicy.ShouldProxy, proxy.UpstreamConfigured()); err != nil {
+ 		if errors.Is(err, sysproxy.ErrUnsupportedDesktopEnvironment) {
+ 			a.frontendEvents.OnUnsupportedDE(err)
+ 		} else {
+diff --git a/internal/proxy/proxy.go b/internal/proxy/proxy.go
+index 0f1b690..acb4df9 100644
+--- a/internal/proxy/proxy.go
++++ b/internal/proxy/proxy.go
+@@ -55,6 +55,7 @@ type Proxy struct {
+ 	requestTransport   http.RoundTripper
+ 	requestClient      *http.Client
+ 	netDialer          *net.Dialer
++	upstreamChain      *chainDialer
+ 	shouldProxy        ShouldProxyFunc
+ 	localHost          string
+ 	localHandler       http.Handler
+@@ -110,6 +111,8 @@ func NewProxy(filter filter, certGenerator certGenerator, port int, shouldProxy
+ 		},
+ 	}
+ 
++	applyUpstreamChain(p)
++
+ 	return p, nil
+ }
+ 
+@@ -517,7 +520,7 @@ func (p *Proxy) addTransparentHost(host string) {
+ // tunnel tunnels the connection between the client and the remote server
+ // without inspecting the traffic.
+ func (p *Proxy) tunnel(w net.Conn, r *http.Request) {
+-	remoteConn, err := p.netDialer.DialContext(r.Context(), "tcp", r.Host) // #nosec G704 -- this is a proxy; forwarding connections is its purpose
++	remoteConn, err := p.tunnelDialContext(r.Context(), "tcp", r.Host) // #nosec G704 -- this is a proxy; forwarding connections is its purpose
+ 	if err != nil {
+ 		log.Printf("dialing remote(%s): %v", redacted.Redacted(r.Host), err)
+ 		w.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+diff --git a/internal/proxy/upstreamchain.go b/internal/proxy/upstreamchain.go
+new file mode 100644
+index 0000000..f6b81e5
+--- /dev/null
++++ b/internal/proxy/upstreamchain.go
+@@ -0,0 +1,494 @@
++package proxy
++
++// Upstream proxy chaining, enabled through the ZEN_UPSTREAM_PROXY environment
++// variable. When the variable holds a valid HTTP proxy address, every outbound
++// path of the proxy is chained through it:
++//
++//   - forwarded plain-HTTP requests and MITM'd requests travel through
++//     requestTransport, which gets a Proxy function pointing at the upstream;
++//   - CONNECT tunnels and WebSocket dials bypass the transport and dial with
++//     netDialer; those call sites go through a chainDialer that first
++//     establishes a CONNECT tunnel via the upstream.
++//
++// The feature keys off the environment variable alone: unset (or invalid,
++// with a logged warning) means stock behaviour. Loopback destinations and the
++// upstream's own address are always dialed directly - a local service would
++// become unreachable through a remote upstream, and CONNECTing to the
++// upstream through itself would recurse.
++
++import (
++	"bufio"
++	"bytes"
++	"context"
++	"crypto/tls"
++	"encoding/base64"
++	"errors"
++	"fmt"
++	"io"
++	"log"
++	"net"
++	"net/http"
++	"net/url"
++	"os"
++	"path/filepath"
++	"strings"
++	"time"
++
++	"github.com/irbis-sh/zen-desktop/internal/redacted"
++)
++
++// upstreamProxyEnv names the environment variable holding the upstream proxy.
++// Accepted forms: "host:port", "http://host:port", "http://user:pass@host:port".
++const upstreamProxyEnv = "ZEN_UPSTREAM_PROXY"
++
++const (
++	// connectHandshakeTimeout bounds the CONNECT handshake with the upstream
++	// when the caller's context carries no deadline. A local upstream answers
++	// within milliseconds; anything past this means the upstream is wedged.
++	connectHandshakeTimeout = 30 * time.Second
++
++	// Chained-mode transport hygiene (2026-09-18): stock Zen dials targets
++	// directly, where a wedged connection costs at most one target. Through
++	// an upstream, the transport's pooled connections die with every upstream
++	// hiccup, and the stock values turn that into minutes-long stalls:
++	//   - ResponseHeaderTimeout 3min: a stale pooled connection hangs the
++	//     request for the full window instead of failing fast and retrying;
++	//   - ForceAttemptHTTP2: every request to a host shares one multiplexed
++	//     connection, so one dead tunnel stalls all of them (head-of-line);
++	//   - IdleConnTimeout 90s: keeps corpses around through upstream
++	//     restarts, and piles up connections on the upstream.
++	// HTTP/1.1 per-request connections isolate failures and make the
++	// maxIdleConnsPerHost=16 pool meaningful again.
++	chainedResponseHeaderTimeout = 30 * time.Second
++	chainedIdleConnTimeout       = 30 * time.Second
++	// chainedForceHTTP1 flips the upstream TLS ALPN to HTTP/1.1 only.
++	chainedForceHTTP1 = false
++)
++
++// upstreamConfigFile names the optional file sitting next to the executable
++// holding the upstream proxy address ("http://host:port" or bare "host:port").
++// It lets the chain engage no matter how Zen is started - Start Menu, autostart
++// or double-click - without touching any persistent environment variable.
++const upstreamConfigFile = "upstream-proxy.txt"
++
++// resolveUpstreamConfig locates the upstream proxy setting. The environment
++// variable wins when set; otherwise a upstream-proxy.txt next to the
++// executable is read. Returns the raw value, a human-readable source for log
++// lines, and whether anything was found.
++func resolveUpstreamConfig() (cfg, source string, ok bool) {
++	if v := os.Getenv(upstreamProxyEnv); strings.TrimSpace(v) != "" {
++		return v, upstreamProxyEnv, true
++	}
++	exe, err := os.Executable()
++	if err != nil {
++		return "", "", false
++	}
++	return readUpstreamConfigFile(filepath.Dir(exe))
++}
++
++// readUpstreamConfigFile reads upstream-proxy.txt from dir, tolerating a BOM
++// and surrounding whitespace. A missing file is silently ignored; anything
++// else that goes wrong is logged and treated as "not configured" - a broken
++// config file must never take the proxy down.
++func readUpstreamConfigFile(dir string) (cfg, source string, ok bool) {
++	path := filepath.Join(dir, upstreamConfigFile)
++	data, err := os.ReadFile(path)
++	if err != nil {
++		if !errors.Is(err, os.ErrNotExist) {
++			log.Printf("upstream proxy: reading %s: %v", path, err)
++		}
++		return "", "", false
++	}
++	// Tolerate editors that save a BOM or surrounding whitespace.
++	v := strings.TrimSpace(strings.TrimPrefix(string(data), "\ufeff"))
++	if v == "" {
++		return "", "", false
++	}
++	return v, path, true
++}
++
++// UpstreamConfigured reports whether an upstream proxy is currently configured
++// (environment variable or upstream-proxy.txt config file). The app consults
++// it when rendering the system PAC file: with chaining active the PAC must not
++// send the sensitive-host exclusions (Google login, github, ...) DIRECT - on
++// censored networks those hosts are exactly the ones only reachable through
++// the chain, and a DIRECT answer makes the browser bypass Zen entirely
++// (2026-09-18: accounts.google.com et al were unreachable with chaining on).
++func UpstreamConfigured() bool {
++	_, _, ok := resolveUpstreamConfig()
++	return ok
++}
++
++// applyUpstreamChain wires the upstream proxy into p, if configured. It is
++// called once from NewProxy, before the proxy starts serving.
++func applyUpstreamChain(p *Proxy) {
++	cfg, source, ok := resolveUpstreamConfig()
++	if !ok {
++		return
++	}
++
++	u, err := parseUpstreamProxyURL(cfg)
++	if err != nil {
++		log.Printf("upstream proxy: ignoring invalid %s=%q from %s: %v", upstreamProxyEnv, cfg, source, err)
++		return
++	}
++
++	transport, ok := p.requestTransport.(*http.Transport)
++	if !ok {
++		log.Printf("upstream proxy: requestTransport is %T, not *http.Transport; chaining disabled", p.requestTransport)
++		return
++	}
++
++	p.upstreamChain = &chainDialer{inner: p.netDialer, proxyURL: u}
++	// Plain-HTTP forwarding and MITM'd requests speak through
++	// requestTransport: pointing its Proxy at the upstream chains them. Its
++	// DialContext stays the plain netDialer - the transport dials the
++	// upstream address itself and speaks the proxy protocol on top.
++	transport.Proxy = http.ProxyURL(u)
++	// Time the transport's own dials to the upstream: the MITM/plain path is
++	// the dominant one for browsers, and its CONNECT stage is Go-internal -
++	// without this there is zero observability when it goes bad.
++	innerDial := p.netDialer.DialContext
++	proxyHost := u.Host
++	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
++		start := time.Now()
++		conn, err := innerDial(ctx, network, addr)
++		if addr == proxyHost {
++			if err != nil {
++				logUpstreamEvent(addr, "transport-dial", time.Since(start), err)
++			} else if elapsed := time.Since(start); elapsed > slowTunnelLogThreshold {
++				logUpstreamEvent(addr, "transport-dial", elapsed, nil)
++			}
++		}
++		return conn, err
++	}
++	applyChainedTransportHygiene(transport)
++
++	log.Printf("upstream proxy: chaining outbound traffic through %s (source: %s)", u.Host, source)
++}
++
++// applyChainedTransportHygiene retunes the transport for upstream-chained
++// operation: fail fast on stale pooled connections, prune idle ones before
++// they rot, and (optionally) drop HTTP/2 multiplexing so one dead tunnel
++// cannot stall every stream multiplexed onto it. Stock (non-chained) behaviour
++// is untouched - this only runs when an upstream is configured.
++func applyChainedTransportHygiene(t *http.Transport) {
++	t.ResponseHeaderTimeout = chainedResponseHeaderTimeout
++	t.IdleConnTimeout = chainedIdleConnTimeout
++	if chainedForceHTTP1 {
++		t.ForceAttemptHTTP2 = false
++		next := t.TLSClientConfig.Clone()
++		if next == nil {
++			next = &tls.Config{}
++		}
++		next.NextProtos = []string{"http/1.1"}
++		t.TLSClientConfig = next
++	}
++}
++
++// tunnelDialContext dials addr for a CONNECT tunnel, chaining through the
++// upstream proxy when configured.
++func (p *Proxy) tunnelDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
++	if p.upstreamChain != nil {
++		return p.upstreamChain.DialContext(ctx, network, addr)
++	}
++	return p.netDialer.DialContext(ctx, network, addr)
++}
++
++// tunnelDial is tunnelDialContext for callers holding no request context.
++func (p *Proxy) tunnelDial() func(network, addr string) (net.Conn, error) {
++	if p.upstreamChain != nil {
++		return p.upstreamChain.Dial
++	}
++	return p.netDialer.Dial
++}
++
++// chainTLSDial returns a dial func that chains through the upstream proxy and
++// completes the TLS handshake to the target, matching tls.Dialer semantics
++// for hijacked WebSocket upgrades.
++func (p *Proxy) chainTLSDial(ctx context.Context) func(network, addr string) (net.Conn, error) {
++	return func(network, addr string) (net.Conn, error) {
++		conn, err := p.upstreamChain.DialContext(ctx, network, addr)
++		if err != nil {
++			return nil, err
++		}
++		tlsConn := tls.Client(conn, &tls.Config{
++			MinVersion: tls.VersionTLS12,
++			ServerName: hostOnly(addr),
++		})
++		if err := tlsConn.HandshakeContext(ctx); err != nil {
++			conn.Close()
++			return nil, fmt.Errorf("TLS handshake with %s via upstream: %w", redacted.Redacted(addr), err)
++		}
++		return tlsConn, nil
++	}
++}
++
++// chainDialer dials TCP addresses through an upstream HTTP proxy, tunneling
++// each target with CONNECT. It offers the DialContext/Dial surface the
++// netDialer call sites expect.
++type chainDialer struct {
++	inner    *net.Dialer
++	proxyURL *url.URL
++}
++
++// slowTunnelLogThreshold bounds the "healthy but slow" noise floor: only
++// tunnel attempts slower than this get a success line. Failures always log.
++const slowTunnelLogThreshold = time.Second
++
++// logUpstreamEvent records a chained-tunnel attempt with its stage and
++// duration. Added 2026-09-18 after a silent failure mode (every target dying
++// at ~2s with zero log lines, healed only by restarting Zen) cost a full
++// diagnosis cycle: the next occurrence must document itself.
++func logUpstreamEvent(addr, stage string, elapsed time.Duration, err error) {
++	if err != nil {
++		log.Printf("upstream proxy: %s to %s failed after %s: %v", stage, redacted.Redacted(addr), elapsed.Round(time.Millisecond), err)
++		return
++	}
++	log.Printf("upstream proxy: %s to %s slow: %s", stage, redacted.Redacted(addr), elapsed.Round(time.Millisecond))
++}
++
++// DialContext implements the net.Dialer.DialContext shape.
++func (d *chainDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
++	if skipChain(addr, d.proxyURL) {
++		return d.inner.DialContext(ctx, network, addr)
++	}
++
++	if network != "tcp" {
++		return nil, fmt.Errorf("upstream proxy: unsupported network %q for CONNECT", network)
++	}
++
++	start := time.Now()
++	conn, err := d.inner.DialContext(ctx, "tcp", d.proxyURL.Host)
++	if err != nil {
++		logUpstreamEvent(addr, "dial-proxy", time.Since(start), err)
++		return nil, fmt.Errorf("dialing upstream proxy %s: %w", d.proxyURL.Host, err)
++	}
++
++	tunneled, err := tunnelThroughUpstream(ctx, conn, d.proxyURL, addr)
++	if err != nil {
++		conn.Close()
++		logUpstreamEvent(addr, "connect", time.Since(start), err)
++		return nil, err
++	}
++	if elapsed := time.Since(start); elapsed > slowTunnelLogThreshold {
++		logUpstreamEvent(addr, "connect", elapsed, nil)
++	}
++	return tunneled, nil
++}
++
++// Dial is the context-free shape used by the hijacked WebSocket dials. It
++// applies the stock dial timeout: with no context there is nothing to honour
++// ctx cancellation by, and a wedged upstream must not block forever.
++func (d *chainDialer) Dial(network, addr string) (net.Conn, error) {
++	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
++	defer cancel()
++	return d.DialContext(ctx, network, addr)
++}
++
++// skipChain reports whether addr must bypass the upstream and dial directly:
++// loopback targets would become unreachable through a remote upstream, and
++// the upstream's own address CONNECTed through itself would recurse.
++func skipChain(addr string, proxyURL *url.URL) bool {
++	host, port, err := net.SplitHostPort(addr)
++	if err != nil {
++		return false
++	}
++	if strings.EqualFold(host, "localhost") {
++		return true
++	}
++	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
++		return true
++	}
++	if host == proxyURL.Hostname() && (proxyURL.Port() == "" || port == proxyURL.Port()) {
++		return true
++	}
++	return false
++}
++
++// tunnelThroughUpstream turns conn into a tunnel to target by issuing CONNECT
++// via proxyURL. On success the returned conn speaks directly to target; any
++// bytes the upstream sent past the response head are preserved.
++//
++// The handshake honours ctx cancellation even when ctx carries no deadline:
++// a caller walking away (browser abort, shutdown) must not leave this
++// goroutine blocked forever on the upstream read, leaking the connection.
++func tunnelThroughUpstream(ctx context.Context, conn net.Conn, proxyURL *url.URL, target string) (net.Conn, error) {
++	// Watchdog: bound the handshake by the ctx deadline when present, by
++	// connectHandshakeTimeout otherwise, and break out early on cancellation.
++	deadline := time.Now().Add(connectHandshakeTimeout)
++	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
++		deadline = dl
++	}
++	if err := conn.SetDeadline(deadline); err != nil {
++		return nil, fmt.Errorf("upstream proxy: setting CONNECT deadline: %w", err)
++	}
++	watchDone := make(chan struct{})
++	defer func() {
++		_ = conn.SetDeadline(time.Time{})
++	}()
++	// Registered after the deadline-clear so it runs FIRST on return (LIFO):
++	// the watchdog must be stopped before the deadline is cleared, or a
++	// late cancellation could poison the just-returned tunnel connection.
++	defer close(watchDone)
++	go func() {
++		select {
++		case <-ctx.Done():
++			_ = conn.SetDeadline(time.Now()) // force pending I/O to fail now
++		case <-watchDone:
++		}
++	}()
++
++	var b strings.Builder
++	fmt.Fprintf(&b, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n", target, target)
++	if auth := proxyAuthorization(proxyURL); auth != "" {
++		fmt.Fprintf(&b, "Proxy-Authorization: %s\r\n", auth)
++	}
++	b.WriteString("\r\n")
++	if _, err := io.WriteString(conn, b.String()); err != nil {
++		return nil, fmt.Errorf("upstream proxy: sending CONNECT %s: %w", redacted.Redacted(target), err)
++	}
++
++	br := bufio.NewReader(conn)
++	req := &http.Request{
++		Method: http.MethodConnect,
++		// Opaque rather than Path: Request.Write only emits the authority
++		// form CONNECT requires, and ReadResponse needs a matching request.
++		URL:  &url.URL{Opaque: target},
++		Host: target,
++	}
++	resp, err := http.ReadResponse(br, req)
++	if err != nil {
++		return nil, fmt.Errorf("upstream proxy: reading CONNECT response for %s: %w", redacted.Redacted(target), err)
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode < 200 || resp.StatusCode > 299 {
++		return nil, fmt.Errorf("upstream proxy: CONNECT %s returned %s", redacted.Redacted(target), resp.Status)
++	}
++
++	// Bytes buffered past the response head already belong to the tunnel;
++	// returning the raw conn alone would strand them in the bufio buffer.
++	if n := br.Buffered(); n > 0 {
++		prefix, err := br.Peek(n)
++		if err != nil {
++			return nil, fmt.Errorf("upstream proxy: reading tunnel bytes for %s: %w", redacted.Redacted(target), err)
++		}
++		buffered := make([]byte, n)
++		copy(buffered, prefix)
++		return &prefixConn{Conn: conn, r: io.MultiReader(bytes.NewReader(buffered), conn)}, nil
++	}
++	return conn, nil
++}
++
++// prefixConn serves the bytes already read past the CONNECT response before
++// the underlying connection, making the bufio buffering invisible to the
++// tunnelled traffic.
++type prefixConn struct {
++	net.Conn
++	r io.Reader
++}
++
++func (c *prefixConn) Read(b []byte) (int, error) {
++	return c.r.Read(b)
++}
++
++// proxyAuthorization builds a Basic Proxy-Authorization header value from the
++// URL's user info, or "" when none is configured.
++func proxyAuthorization(u *url.URL) string {
++	if u.User == nil {
++		return ""
++	}
++	password, _ := u.User.Password()
++	token := base64.StdEncoding.EncodeToString([]byte(u.User.Username() + ":" + password))
++	return "Basic " + token
++}
++
++// parseUpstreamProxyURL normalises a ZEN_UPSTREAM_PROXY value into an HTTP
++// proxy URL. Bare "host:port" is accepted and read as http; the port defaults
++// to 80 when omitted. Any other scheme is rejected.
++func parseUpstreamProxyURL(cfg string) (*url.URL, error) {
++	cfg = strings.TrimSpace(cfg)
++	if cfg == "" {
++		return nil, errors.New("empty value")
++	}
++	if !strings.Contains(cfg, "://") {
++		cfg = "http://" + cfg
++	}
++	u, err := url.Parse(cfg)
++	if err != nil {
++		return nil, fmt.Errorf("parsing URL: %w", err)
++	}
++	if u.Scheme != "http" {
++		return nil, fmt.Errorf("unsupported scheme %q: only http upstream proxies are supported", u.Scheme)
++	}
++	if u.Hostname() == "" {
++		return nil, errors.New("missing host")
++	}
++	if !validProxyHost(u.Hostname()) {
++		return nil, fmt.Errorf("invalid host %q", u.Hostname())
++	}
++	if u.Port() == "" {
++		u.Host = net.JoinHostPort(u.Hostname(), "80")
++	}
++	if u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
++		return nil, errors.New("unexpected path or query in proxy URL")
++	}
++	return u, nil
++}
++
++// validProxyHost reports whether host is a plausible proxy address: a hostname
++// or IPv4 literal, or a bracketed IPv6 literal. url.Parse is deliberately
++// lenient, so a bare character-set check rejects garbage before it reaches
++// the dialer.
++func validProxyHost(host string) bool {
++	if strings.HasSuffix(host, "]") && strings.HasPrefix(host, "[") {
++		// Bracketed IPv6 literal; the digits, colons and dots are checked by
++		// the dialer when the address is used.
++		for _, r := range host[1 : len(host)-1] {
++			if !strings.ContainsRune("0123456789abcdefABCDEF:.", r) {
++				return false
++			}
++		}
++		return true
++	}
++	if host == "" {
++		return false
++	}
++	for _, r := range host {
++		if !('a' <= r && r <= 'z' || 'A' <= r && r <= 'Z' || '0' <= r && r <= '9' || r == '.' || r == '-' || r == '_') {
++			return false
++		}
++	}
++	return true
++}
++
++// hostOnly strips the port from a host:port pair, leaving IPv6 literals
++// bracketed form aside as plain addresses.
++func hostOnly(addr string) string {
++	host, _, err := net.SplitHostPort(addr)
++	if err != nil {
++		return addr
++	}
++	return host
++}
++
++// Filter-list downloads and update checks use DefaultTransport-based clients,
++// whose proxy lookup reads the standard environment variables lazily on first
++// use - long after package init. Mirroring the upstream setting into those
++// variables chains them too; loopback targets stay excluded by net/http.
++func init() {
++	cfg, source, ok := resolveUpstreamConfig()
++	if !ok {
++		return
++	}
++	u, err := parseUpstreamProxyURL(cfg)
++	if err != nil {
++		log.Printf("upstream proxy: ignoring invalid %s=%q from %s: %v", upstreamProxyEnv, cfg, source, err)
++		return
++	}
++	for _, name := range []string{"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"} {
++		if err := os.Setenv(name, u.String()); err != nil {
++			log.Printf("upstream proxy: setting %s: %v", name, err)
++		}
++	}
++}
+diff --git a/internal/proxy/upstreamchain_test.go b/internal/proxy/upstreamchain_test.go
+new file mode 100644
+index 0000000..d7ac7de
+--- /dev/null
++++ b/internal/proxy/upstreamchain_test.go
+@@ -0,0 +1,468 @@
++package proxy
++
++import (
++	"bufio"
++	"context"
++	"crypto/tls"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++// startFakeUpstreamProxy runs a minimal HTTP forward proxy. Plain-HTTP
++// requests arrive in absolute form and are relayed to their URL. CONNECT
++// requests are tunnelled: in relay mode to the real target the CONNECT names
++// (the MITM test points one at a live local TLS server); in echo mode the
++// tunnel payload is echoed back (the tunnel tests point at names nothing
++// dialable answers for). connectHits counts CONNECT commands, plainHits
++// counts relayed requests. The relay uses a bare transport on purpose: the
++// fake upstream stands in for a foreign proxy that dials directly.
++func startFakeUpstreamProxy(t *testing.T, echoTunnels bool) (connectHits *atomic.Int64, plainHits *atomic.Int64, addr string) {
++	t.Helper()
++
++	var connects, plains atomic.Int64
++	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.Method == http.MethodConnect {
++			connects.Add(1)
++
++			hj, ok := w.(http.Hijacker)
++			if !ok {
++				http.Error(w, "no hijack", http.StatusInternalServerError)
++				return
++			}
++			targetConn, _, err := hj.Hijack()
++			if err != nil {
++				return
++			}
++			defer targetConn.Close()
++
++			if _, err := targetConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
++				return
++			}
++
++			if echoTunnels {
++				io.Copy(targetConn, targetConn)
++				return
++			}
++
++			remote, err := net.DialTimeout("tcp", r.Host, backstopTimeout)
++			if err != nil {
++				return
++			}
++			defer remote.Close()
++			linkBidirectionalTunnel(targetConn, remote)
++			return
++		}
++
++		plains.Add(1)
++
++		// Absolute-form request URL names the real target.
++		if r.URL.Host == "" {
++			http.Error(w, "not an absolute-form request", http.StatusBadRequest)
++			return
++		}
++		out, err := http.NewRequest(r.Method, r.URL.String(), r.Body)
++		if err != nil {
++			http.Error(w, fmt.Sprintf("build request: %v", err), http.StatusBadGateway)
++			return
++		}
++		out.Header = r.Header.Clone()
++		resp, err := http.DefaultTransport.RoundTrip(out)
++		if err != nil {
++			http.Error(w, fmt.Sprintf("relay: %v", err), http.StatusBadGateway)
++			return
++		}
++		defer resp.Body.Close()
++		for k, vv := range resp.Header {
++			for _, v := range vv {
++				w.Header().Add(k, v)
++			}
++		}
++		w.WriteHeader(resp.StatusCode)
++		io.Copy(w, resp.Body)
++	}))
++	t.Cleanup(upstream.Close)
++
++	return &connects, &plains, strings.TrimPrefix(upstream.URL, "http://")
++}
++
++// TestUpstreamChainPlainHTTP pins the plain-HTTP forwarding path: a request
++// made through Zen must arrive at the upstream proxy, and its response must
++// make it back to the client.
++func TestUpstreamChainPlainHTTP(t *testing.T) {
++	_, plains, upstreamAddr := startFakeUpstreamProxy(t, false)
++	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		io.WriteString(w, "through the chain")
++	}))
++	defer target.Close()
++
++	t.Setenv(upstreamProxyEnv, upstreamAddr)
++	addr := startTestProxy(t, nil)
++
++	resp, err := proxyClient(t, addr).Get(target.URL)
++	if err != nil {
++		t.Fatalf("get through chained proxy: %v", err)
++	}
++	defer resp.Body.Close()
++	body, err := io.ReadAll(resp.Body)
++	if err != nil {
++		t.Fatalf("read body: %v", err)
++	}
++	if string(body) != "through the chain" {
++		t.Fatalf("body = %q, want %q", body, "through the chain")
++	}
++
++	if got := plains.Load(); got != 1 {
++		t.Fatalf("upstream plain hits = %d, want 1", got)
++	}
++}
++
++// TestUpstreamChainMITM pins the HTTPS path: after the MITM handshake Zen
++// relays the request through the upstream proxy, tunnelling to the target
++// with CONNECT. The self-signed certificate generator and the skip-verify
++// transport stand in for the trust a real installation has: the generator
++// mints the leaves clients accept, and Zen's outbound transport would
++// otherwise reject httptest's own certificate.
++func TestUpstreamChainMITM(t *testing.T) {
++	connects, _, upstreamAddr := startFakeUpstreamProxy(t, false)
++	tlsTarget := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		io.WriteString(w, "mitm through the chain")
++	}))
++	defer tlsTarget.Close()
++
++	t.Setenv(upstreamProxyEnv, upstreamAddr)
++	addr := startTestProxy(t, func(p *Proxy) {
++		p.certGenerator = selfSignedCertGenerator{}
++		// The transport is built without a TLS config, so assign one whole.
++		transportOf(t, p).TLSClientConfig = &tls.Config{InsecureSkipVerify: true} // #nosec G402 -- the upstream target is an httptest server; trust is not under test.
++	})
++
++	status, body := mitmGet(t, addr, fmt.Sprintf("localhost:%d", portOf(t, tlsTarget)), "localhost")
++	if status != http.StatusOK {
++		t.Fatalf("status = %d, want %d", status, http.StatusOK)
++	}
++	if body != "mitm through the chain" {
++		t.Fatalf("body = %q, want %q", body, "mitm through the chain")
++	}
++	if got := connects.Load(); got < 1 {
++		t.Fatalf("upstream CONNECT hits = %d, want >= 1", got)
++	}
++}
++
++// TestUpstreamChainTunnel pins the passthrough CONNECT path: a host on the
++// transparent list is tunnelled, and the tunnel must be established via the
++// upstream proxy.
++func TestUpstreamChainTunnel(t *testing.T) {
++	connects, _, upstreamAddr := startFakeUpstreamProxy(t, true)
++
++	t.Setenv(upstreamProxyEnv, upstreamAddr)
++	addr := startTestProxy(t, func(p *Proxy) {
++		p.addTransparentHost("chain.example.invalid")
++	})
++
++	conn, br, resp := connectThrough(t, addr, "chain.example.invalid:443")
++	if resp.StatusCode != http.StatusOK {
++		t.Fatalf("CONNECT status = %d, want %d", resp.StatusCode, http.StatusOK)
++	}
++
++	if _, err := io.WriteString(conn, "ping"); err != nil {
++		t.Fatalf("write into tunnel: %v", err)
++	}
++	conn.SetReadDeadline(time.Now().Add(backstopTimeout))
++	echo := make([]byte, 4)
++	if _, err := io.ReadFull(br, echo); err != nil {
++		t.Fatalf("read echo: %v", err)
++	}
++	if string(echo) != "ping" {
++		t.Fatalf("echo = %q, want %q", echo, "ping")
++	}
++
++	if got := connects.Load(); got != 1 {
++		t.Fatalf("upstream CONNECT hits = %d, want 1", got)
++	}
++}
++
++// TestUpstreamChainSkipsLoopbackTargets holds the loopback guard: with the
++// chain pointed at a dead upstream, tunnelling to a loopback target must
++// still succeed by dialing directly.
++func TestUpstreamChainSkipsLoopbackTargets(t *testing.T) {
++	want := "loopback stays direct"
++	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		io.WriteString(w, want)
++	}))
++	defer target.Close()
++
++	// Port 1 on loopback: nothing listens there, any chain attempt fails.
++	t.Setenv(upstreamProxyEnv, "127.0.0.1:1")
++
++	_, addr := startLocalEndpointProxy(t, noopFilter{}, nil)
++
++	conn, br, resp := connectThrough(t, addr, target.Listener.Addr().String())
++	if resp.StatusCode != http.StatusOK {
++		t.Fatalf("CONNECT status = %d, want %d", resp.StatusCode, http.StatusOK)
++	}
++
++	req, err := http.NewRequest(http.MethodGet, target.URL, nil)
++	if err != nil {
++		t.Fatalf("build tunnelled request: %v", err)
++	}
++	if err := req.Write(conn); err != nil {
++		t.Fatalf("write tunnelled request: %v", err)
++	}
++	conn.SetReadDeadline(time.Now().Add(backstopTimeout))
++	tunnelled, err := http.ReadResponse(br, req)
++	if err != nil {
++		t.Fatalf("read tunnelled response: %v", err)
++	}
++	defer tunnelled.Body.Close()
++
++	body, err := io.ReadAll(tunnelled.Body)
++	if err != nil {
++		t.Fatalf("read tunnelled body: %v", err)
++	}
++	if string(body) != want {
++		t.Fatalf("body = %q, want %q", body, want)
++	}
++}
++
++// TestChainDialerPreservesEarlyTunnelBytes pins the CONNECT-response parsing:
++// payload bytes arriving in the same segment as the response head must reach
++// the tunnel reader, not rot in the bufio buffer.
++func TestChainDialerPreservesEarlyTunnelBytes(t *testing.T) {
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatalf("listen: %v", err)
++	}
++	defer ln.Close()
++	go func() {
++		conn, err := ln.Accept()
++		if err != nil {
++			return
++		}
++		defer conn.Close()
++		// Consume the CONNECT request so the echo loop only ever reflects
++		// tunnel payload; then answer with head and payload in a single
++		// write, as a chatty upstream proxy bundled into one segment would.
++		br := bufio.NewReader(conn)
++		req, err := http.ReadRequest(br)
++		if err != nil || req.Method != http.MethodConnect {
++			return
++		}
++		conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\nEARLY"))
++		io.Copy(conn, br)
++	}()
++
++	u, err := url.Parse("http://" + ln.Addr().String())
++	if err != nil {
++		t.Fatalf("parse url: %v", err)
++	}
++	d := &chainDialer{inner: &net.Dialer{Timeout: backstopTimeout}, proxyURL: u}
++
++	ctx, cancel := context.WithTimeout(context.Background(), backstopTimeout)
++	defer cancel()
++	conn, err := d.DialContext(ctx, "tcp", "target.example.invalid:443")
++	if err != nil {
++		t.Fatalf("dial via chain: %v", err)
++	}
++	defer conn.Close()
++
++	head := make([]byte, 5)
++	if _, err := io.ReadFull(conn, head); err != nil {
++		t.Fatalf("read early bytes: %v", err)
++	}
++	if string(head) != "EARLY" {
++		t.Fatalf("early bytes = %q, want %q", head, "EARLY")
++	}
++
++	if _, err := io.WriteString(conn, "ping"); err != nil {
++		t.Fatalf("write into tunnel: %v", err)
++	}
++	conn.SetReadDeadline(time.Now().Add(backstopTimeout))
++	echo := make([]byte, 4)
++	if _, err := io.ReadFull(conn, echo); err != nil {
++		t.Fatalf("read echo: %v", err)
++	}
++	if string(echo) != "ping" {
++		t.Fatalf("echo = %q, want %q", echo, "ping")
++	}
++}
++
++// TestParseUpstreamProxyURL covers the accepted and rejected configuration
++// forms.
++func TestParseUpstreamProxyURL(t *testing.T) {
++	cases := []struct {
++		name    string
++		in      string
++		want    string
++		wantErr bool
++	}{
++		{"bare host port", "192.0.2.1:8080", "http://192.0.2.1:8080", false},
++		{"full url", "http://192.0.2.1:8080", "http://192.0.2.1:8080", false},
++		{"default port", "192.0.2.1", "http://192.0.2.1:80", false},
++		{"userinfo", "http://user:pass@192.0.2.1:8080", "http://user:pass@192.0.2.1:8080", false},
++		{"whitespace", "  http://192.0.2.1:8080  ", "http://192.0.2.1:8080", false},
++		{"socks rejected", "socks5://192.0.2.1:1080", "", true},
++		{"empty", "   ", "", true},
++		{"no host", "http://", "", true},
++		{"path rejected", "http://192.0.2.1:8080/path", "", true},
++		{"not a url", "http://\"bad\"", "", true},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			u, err := parseUpstreamProxyURL(tc.in)
++			if tc.wantErr {
++				if err == nil {
++					t.Fatalf("parseUpstreamProxyURL(%q) = %v, want error", tc.in, u)
++				}
++				return
++			}
++			if err != nil {
++				t.Fatalf("parseUpstreamProxyURL(%q): %v", tc.in, err)
++			}
++			if u.String() != tc.want {
++				t.Fatalf("parseUpstreamProxyURL(%q) = %q, want %q", tc.in, u.String(), tc.want)
++			}
++		})
++	}
++}
++
++// TestSkipChain pins the direct-dial guards.
++func TestSkipChain(t *testing.T) {
++	upstream := &url.URL{Scheme: "http", Host: "192.0.2.1:8080"}
++
++	for _, addr := range []string{"127.0.0.1:80", "localhost:8080", "[::1]:443", "192.0.2.1:8080"} {
++		if !skipChain(addr, upstream) {
++			t.Errorf("skipChain(%q) = false, want true", addr)
++		}
++	}
++	for _, addr := range []string{"example.com:443", "192.0.2.1:9090", "192.0.2.53:53"} {
++		if skipChain(addr, upstream) {
++			t.Errorf("skipChain(%q) = true, want false", addr)
++		}
++	}
++}
++
++// TestUnsetEnvKeepsStockBehaviour pins the off switch: with the variable
++// unset, the transport keeps no Proxy and no chain dialer is installed.
++func TestUnsetEnvKeepsStockBehaviour(t *testing.T) {
++	t.Setenv(upstreamProxyEnv, "")
++
++	p := newTestProxy(t)
++
++	if p.upstreamChain != nil {
++		t.Fatal("upstreamChain installed despite unset environment variable")
++	}
++	if transportOf(t, p).Proxy != nil {
++		t.Fatal("transport Proxy set despite unset environment variable")
++	}
++}
++
++// TestInvalidEnvKeepsStockBehaviour pins the fail-open rule: an invalid value
++// disables chaining rather than breaking startup.
++func TestInvalidEnvKeepsStockBehaviour(t *testing.T) {
++	t.Setenv(upstreamProxyEnv, "ftp://not-a-proxy")
++
++	p := newTestProxy(t)
++
++	if p.upstreamChain != nil {
++		t.Fatal("upstreamChain installed despite invalid configuration")
++	}
++	if transportOf(t, p).Proxy != nil {
++		t.Fatal("transport Proxy set despite invalid configuration")
++	}
++}
++
++// portOf returns the port an httptest server listens on.
++func portOf(t *testing.T, s *httptest.Server) int {
++	t.Helper()
++
++	_, port, err := net.SplitHostPort(strings.TrimPrefix(s.URL, "http://"))
++	if err != nil {
++		if _, port2, err2 := net.SplitHostPort(strings.TrimPrefix(s.URL, "https://")); err2 == nil {
++			return atoiPort(t, port2)
++		}
++		t.Fatalf("split server url: %v", err)
++	}
++	return atoiPort(t, port)
++}
++
++func atoiPort(t *testing.T, port string) int {
++	t.Helper()
++
++	var n int
++	if _, err := fmt.Sscanf(port, "%d", &n); err != nil {
++		t.Fatalf("parse port %q: %v", port, err)
++	}
++	return n
++}
++
++// TestReadUpstreamConfigFile covers the config-file source of the upstream
++// setting: valid value, BOM/whitespace tolerance, empty file and missing file.
++// (2026-09-18: config-file source added so the chain engages no matter how
++// Zen is started, without persistent environment variables.)
++func TestReadUpstreamConfigFile(t *testing.T) {
++	dir := t.TempDir()
++
++	if _, _, ok := readUpstreamConfigFile(filepath.Join(dir, "missing")); ok {
++		t.Fatal("missing config file must not resolve")
++	}
++
++	path := filepath.Join(dir, upstreamConfigFile)
++	cases := []struct {
++		name    string
++		content string
++		want    string
++	}{
++		{"plain", "http://1.2.3.4:8080\r\n", "http://1.2.3.4:8080"},
++		{"bare host port", "10.0.0.1:7890\n", "10.0.0.1:7890"},
++		{"bom and whitespace", "\ufeff  192.168.1.1:8080 \r\n", "192.168.1.1:8080"},
++		{"empty file", "  \r\n", ""},
++	}
++	for _, tc := range cases {
++		if err := os.WriteFile(path, []byte(tc.content), 0o600); err != nil {
++			t.Fatalf("write %s: %v", tc.name, err)
++		}
++		cfg, source, ok := readUpstreamConfigFile(dir)
++		if tc.want == "" {
++			if ok {
++				t.Fatalf("%s: empty config must not resolve (got %q)", tc.name, cfg)
++			}
++			continue
++		}
++		if !ok {
++			t.Fatalf("%s: expected resolution, got none", tc.name)
++		}
++		if cfg != tc.want {
++			t.Fatalf("%s: cfg = %q, want %q", tc.name, cfg, tc.want)
++		}
++		if source != path {
++			t.Fatalf("%s: source = %q, want %q", tc.name, source, path)
++		}
++	}
++}
++
++// TestResolveUpstreamConfigEnvWins pins the precedence: a set environment
++// variable always wins over any config file on disk.
++func TestResolveUpstreamConfigEnvWins(t *testing.T) {
++	t.Setenv(upstreamProxyEnv, "http://9.9.9.9:1")
++
++	cfg, source, ok := resolveUpstreamConfig()
++	if !ok {
++		t.Fatal("env var set but not resolved")
++	}
++	if cfg != "http://9.9.9.9:1" {
++		t.Fatalf("cfg = %q, want env value", cfg)
++	}
++	if source != upstreamProxyEnv {
++		t.Fatalf("source = %q, want %q", source, upstreamProxyEnv)
++	}
++}
+diff --git a/internal/proxy/websocket.go b/internal/proxy/websocket.go
+index d14441f..754477c 100644
+--- a/internal/proxy/websocket.go
++++ b/internal/proxy/websocket.go
+@@ -12,12 +12,16 @@ import (
+ )
+ 
+ func (p *Proxy) proxyWebsocketTLS(w http.ResponseWriter, req *http.Request) {
++	if p.upstreamChain != nil {
++		hijackAndTunnelWebsocket(w, req, p.chainTLSDial(req.Context()))
++		return
++	}
+ 	dialer := &tls.Dialer{NetDialer: p.netDialer, Config: &tls.Config{MinVersion: tls.VersionTLS12}}
+ 	hijackAndTunnelWebsocket(w, req, dialer.Dial)
+ }
+ 
+ func (p *Proxy) proxyWebsocket(w http.ResponseWriter, req *http.Request) {
+-	hijackAndTunnelWebsocket(w, req, p.netDialer.Dial)
++	hijackAndTunnelWebsocket(w, req, p.tunnelDial())
+ }
+ 
+ func hijackAndTunnelWebsocket(w http.ResponseWriter, req *http.Request, dial func(network, addr string) (net.Conn, error)) {
+diff --git a/internal/sysproxy/manager.go b/internal/sysproxy/manager.go
+index 014bd7b..0e6804c 100644
+--- a/internal/sysproxy/manager.go
++++ b/internal/sysproxy/manager.go
+@@ -46,12 +46,15 @@ func (m *Manager) SetPACPort(pacPort int) {
+ }
+ 
+ // Set configures the system proxy to use the proxy server listening on the given port.
+-func (m *Manager) Set(proxyPort int, userConfiguredExcludedHosts []string, shouldProxy ShouldProxyFunc) error {
++// When chainActive is set (an upstream proxy is configured), sensitive-host PAC
++// exclusions are dropped so auth/login hosts flow through the chain instead of
++// going DIRECT (unreachable on censored networks).
++func (m *Manager) Set(proxyPort int, userConfiguredExcludedHosts []string, shouldProxy ShouldProxyFunc, chainActive bool) error {
+ 	if shouldProxy == nil {
+ 		return fmt.Errorf("shouldProxy is nil")
+ 	}
+ 
+-	pac := renderPac(proxyPort, userConfiguredExcludedHosts)
++	pac := renderPac(proxyPort, userConfiguredExcludedHosts, chainActive)
+ 
+ 	actualPort, err := m.makeServer(pac, shouldProxy)
+ 	if err != nil {
+diff --git a/internal/sysproxy/pac.go b/internal/sysproxy/pac.go
+index 6d992a5..082c3b0 100644
+--- a/internal/sysproxy/pac.go
++++ b/internal/sysproxy/pac.go
+@@ -34,7 +34,17 @@ var (
+ )
+ 
+ // renderPac returns the PAC file content for the given proxy port and user-configured excluded hosts.
+-func renderPac(proxyPort int, userConfiguredExcludedHosts []string) []byte {
++// When chainActive is set (an upstream proxy is configured), the sensitive-host
++// exclusions are dropped: on censored networks those hosts are reachable only
++// through the chain, and a DIRECT answer in the PAC makes the browser bypass
++// Zen entirely (2026-09-18: accounts.google.com et al were unreachable).
++func renderPac(proxyPort int, userConfiguredExcludedHosts []string, chainActive bool) []byte {
++	// The exclusion list spans the embedded common/platform lists AND user
++	// config, so the gate must cover the whole build - not just the user part.
++	var excludedHosts []string
++	if !chainActive {
++		excludedHosts = buildExcludedHosts(userConfiguredExcludedHosts)
++	}
+ 	var buf bytes.Buffer
+ 	pacTemplate.Execute(&buf, struct {
+ 		ProxyPort         int
+@@ -43,7 +53,7 @@ func renderPac(proxyPort int, userConfiguredExcludedHosts []string) []byte {
+ 	}{
+ 		ProxyPort:         proxyPort,
+ 		LocalEndpointHost: constants.LocalEndpointHost,
+-		ExcludedHosts:     buildExcludedHosts(userConfiguredExcludedHosts),
++		ExcludedHosts:     excludedHosts,
+ 	})
+ 	return buf.Bytes()
+ }
+diff --git a/internal/sysproxy/pac_test.go b/internal/sysproxy/pac_test.go
+index 5e5c708..7035435 100644
+--- a/internal/sysproxy/pac_test.go
++++ b/internal/sysproxy/pac_test.go
+@@ -19,7 +19,7 @@ import (
+ func TestRenderPacLocalEndpointWinsOverExclusions(t *testing.T) {
+ 	t.Parallel()
+ 
+-	pac := string(renderPac(1234, []string{"irbis.sh"}))
++	pac := string(renderPac(1234, []string{"irbis.sh"}, false))
+ 
+ 	carveOutRe := regexp.MustCompile(
+ 		fmt.Sprintf(`if \(host == "%s"\)\s*\{\s*return "PROXY 127\.0\.0\.1:1234";\s*\}`,
+@@ -41,3 +41,25 @@ func TestRenderPacLocalEndpointWinsOverExclusions(t *testing.T) {
+ 		t.Fatalf("local endpoint carve-out at %d comes after exclusion matching at %d:\n%s", carveOut[0], exclusionsIndex, pac)
+ 	}
+ }
++
++// TestRenderPacChainActiveDropsExclusions pins the chaining behaviour: with an
++// upstream configured, the sensitive-host exclusions must not appear in the
++// PAC at all - a DIRECT answer there sends auth/login hosts around Zen, which
++// on censored networks makes them unreachable (2026-09-18: accounts.google.com
++// et al never reached the chain from the browser).
++func TestRenderPacChainActiveDropsExclusions(t *testing.T) {
++	t.Parallel()
++
++	pac := string(renderPac(1234, []string{"accounts.google.com"}, true))
++	if strings.Contains(pac, "accounts.google.com") {
++		t.Fatalf("chain-active PAC still carries the exclusion:\n%s", pac)
++	}
++	if !strings.Contains(pac, "var excludedHosts = [];") {
++		t.Fatalf("chain-active PAC exclusion list is not empty:\n%s", pac)
++	}
++
++	pac = string(renderPac(1234, []string{"irbis.sh"}, false))
++	if !strings.Contains(pac, "irbis.sh") {
++		t.Fatalf("non-chain PAC lost the exclusion list:\n%s", pac)
++	}
++}
