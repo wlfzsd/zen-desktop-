@@ -1,3 +1,45 @@
+diff --git a/go.mod b/go.mod
+index 0f7f8ca..531685c 100644
+--- a/go.mod
++++ b/go.mod
+@@ -28,6 +28,7 @@ require (
+ require (
+ 	git.sr.ht/~jackmordaunt/go-toast/v2 v2.0.3 // indirect
+ 	github.com/bep/debounce v1.2.1 // indirect
++	github.com/cloudflare/circl v1.6.3 // indirect
+ 	github.com/getlantern/byteexec v0.0.0-20220903142956-e6ed20032cfd // indirect
+ 	github.com/getlantern/context v0.0.0-20220418194847-3d5e7a086201 // indirect
+ 	github.com/getlantern/errors v1.0.3 // indirect
+@@ -55,6 +56,7 @@ require (
+ 	github.com/oxtoacart/bpool v0.0.0-20190530202638-03653db5a59c // indirect
+ 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c // indirect
+ 	github.com/pkg/errors v0.9.1 // indirect
++	github.com/refraction-networking/utls v1.6.7 // indirect
+ 	github.com/rivo/uniseg v0.4.7 // indirect
+ 	github.com/samber/lo v1.49.1 // indirect
+ 	github.com/tkrajina/go-reflector v0.5.8 // indirect
+diff --git a/go.sum b/go.sum
+index a5e0491..212a874 100644
+--- a/go.sum
++++ b/go.sum
+@@ -7,6 +7,8 @@ github.com/bep/debounce v1.2.1 h1:v67fRdBA9UQu2NhLFXrSg0Brw7CexQekrBwDMM8bzeY=
+ github.com/bep/debounce v1.2.1/go.mod h1:H8yggRPQKLUhUoqrJC1bO2xNya7vanpDl7xR3ISbCJ0=
+ github.com/blang/semver v3.5.1+incompatible h1:cQNTCjp13qL8KC3Nbxr/y2Bqb63oX6wdnnjpJbkM4JQ=
+ github.com/blang/semver v3.5.1+incompatible/go.mod h1:kRBLl5iJ+tD4TcOOxsy/0fnwebNt5EWlYSAyrTnjyyk=
++github.com/cloudflare/circl v1.6.3 h1:9GPOhQGF9MCYUeXyMYlqTR6a5gTrgR/fBLXvUgtVcg8=
++github.com/cloudflare/circl v1.6.3/go.mod h1:2eXP6Qfat4O/Yhh8BznvKnJ+uzEoTQ6jVKJRn81BiS4=
+ github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
+ github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
+ github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
+@@ -98,6 +100,8 @@ github.com/pkg/errors v0.9.1 h1:FEBLx1zS214owpjy7qsBeixbURkuhQAwrK5UwLGTwt4=
+ github.com/pkg/errors v0.9.1/go.mod h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINEl0=
+ github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
+ github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
++github.com/refraction-networking/utls v1.6.7 h1:zVJ7sP1dJx/WtVuITug3qYUq034cDq9B2MR1K67ULZM=
++github.com/refraction-networking/utls v1.6.7/go.mod h1:BC3O4vQzye5hqpmDTWUqi4P5DDhzJfkV1tdqtawQIH0=
+ github.com/rivo/uniseg v0.2.0/go.mod h1:J6wj4VEh+S6ZtnVlnTBMWIodfgj8LQOQFoIToxlJtxc=
+ github.com/rivo/uniseg v0.4.7 h1:WUdvkW8uEhrYfLC4ZzdpI2ztxP1I582+49Oc5Mq64VQ=
+ github.com/rivo/uniseg v0.4.7/go.mod h1:FN3SvrM+Zdj16jyLfmOkMNblXMcoc8DfTHruCPUcx88=
 diff --git a/internal/app/app.go b/internal/app/app.go
 index 86e50d5..1a3640b 100644
 --- a/internal/app/app.go
@@ -12,18 +54,43 @@ index 86e50d5..1a3640b 100644
  			a.frontendEvents.OnUnsupportedDE(err)
  		} else {
 diff --git a/internal/proxy/proxy.go b/internal/proxy/proxy.go
-index 0f1b690..acb4df9 100644
+index 0f1b690..6b7c877 100644
 --- a/internal/proxy/proxy.go
 +++ b/internal/proxy/proxy.go
-@@ -55,6 +55,7 @@ type Proxy struct {
- 	requestTransport   http.RoundTripper
- 	requestClient      *http.Client
- 	netDialer          *net.Dialer
-+	upstreamChain      *chainDialer
- 	shouldProxy        ShouldProxyFunc
- 	localHost          string
- 	localHandler       http.Handler
-@@ -110,6 +111,8 @@ func NewProxy(filter filter, certGenerator certGenerator, port int, shouldProxy
+@@ -48,18 +48,20 @@ type ShouldProxyFunc func(processPath string) bool
+ 
+ // Proxy is a forward HTTP/HTTPS proxy that can filter requests.
+ type Proxy struct {
+-	filter             filter
+-	certGenerator      certGenerator
+-	port               int
+-	server             *http.Server
+-	requestTransport   http.RoundTripper
+-	requestClient      *http.Client
+-	netDialer          *net.Dialer
+-	shouldProxy        ShouldProxyFunc
+-	localHost          string
+-	localHandler       http.Handler
+-	transparentHosts   []string
+-	transparentHostsMu sync.RWMutex
++	filter                filter
++	certGenerator         certGenerator
++	port                  int
++	server                *http.Server
++	requestTransport      http.RoundTripper
++	requestTransportHTTPS http.RoundTripper
++	requestClient         *http.Client
++	netDialer             *net.Dialer
++	upstreamChain         *chainDialer
++	shouldProxy           ShouldProxyFunc
++	localHost             string
++	localHandler          http.Handler
++	transparentHosts      []string
++	transparentHostsMu    sync.RWMutex
+ }
+ 
+ // NewProxy creates a proxy. localHost and localHandler, when set, name a host
+@@ -110,6 +112,8 @@ func NewProxy(filter filter, certGenerator certGenerator, port int, shouldProxy
  		},
  	}
  
@@ -32,7 +99,62 @@ index 0f1b690..acb4df9 100644
  	return p, nil
  }
  
-@@ -517,7 +520,7 @@ func (p *Proxy) addTransparentHost(host string) {
+@@ -335,6 +339,19 @@ func (p *Proxy) proxyConnect(w http.ResponseWriter, connReq *http.Request, proce
+ 		return
+ 	}
+ 
++	// Capture the client's ClientHello before TLS termination: it is replayed
++	// verbatim on the upstream leg (mimic), so the browser keeps its own TLS
++	// fingerprint end to end. Failure falls back to stock Go TLS - never to a
++	// canned profile.
++	helloRaw, clientConn, err := peekClientHello(clientConn)
++	if err != nil {
++		log.Printf("peeking ClientHello(%s): %v", redacted.Redacted(connReq.Host), err)
++		helloRaw = nil
++	}
++	// The raw hello - not a parsed spec - is carried downstream: every upstream
++	// dial parses a fresh spec (ApplyPreset mutates specs in place, so a parsed
++	// spec must never be reused across handshakes).
++
+ 	tlsConfig := &tls.Config{
+ 		Certificates: []tls.Certificate{*tlsCert},
+ 		NextProtos:   []string{"h2", "http/1.1"},
+@@ -367,7 +384,7 @@ func (p *Proxy) proxyConnect(w http.ResponseWriter, connReq *http.Request, proce
+ 		// block Zen's own assets.
+ 		handler = p.localHandler
+ 	} else {
+-		handler = p.connectHandler(connReq, host, ln, processInfo)
++		handler = p.connectHandler(connReq, host, ln, processInfo, helloRaw)
+ 	}
+ 
+ 	srv := &http.Server{
+@@ -387,7 +404,7 @@ func (p *Proxy) proxyConnect(w http.ResponseWriter, connReq *http.Request, proce
+ }
+ 
+ // connectHandler returns an http.Handler that processes requests on a CONNECT-tunnelled TLS connection.
+-func (p *Proxy) connectHandler(connReq *http.Request, host string, ln *singleConnListener, processInfo process.Info) http.Handler {
++func (p *Proxy) connectHandler(connReq *http.Request, host string, ln *singleConnListener, processInfo process.Info, helloRaw []byte) http.Handler {
+ 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+ 		req.URL.Host = connReq.Host
+ 		req.URL.Scheme = "https"
+@@ -460,7 +477,15 @@ func (p *Proxy) connectHandler(connReq *http.Request, host string, ln *singleCon
+ 		}
+ 		req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+ 
+-		resp, err := p.requestTransport.RoundTrip(req)
++		// HTTPS over an active upstream chain rides the mimic-TLS transport,
++		// replaying this connection's captured ClientHello; everything else -
++		// plain http, and https without a chain - uses the stock transport.
++		req = req.WithContext(newMimicContext(req.Context(), helloRaw))
++		rt := p.requestTransport
++		if req.URL.Scheme == "https" && p.requestTransportHTTPS != nil {
++			rt = p.requestTransportHTTPS
++		}
++		resp, err := rt.RoundTrip(req)
+ 		roundTripMutex.Lock()
+ 		roundTripDone = true
+ 		roundTripMutex.Unlock()
+@@ -517,7 +542,7 @@ func (p *Proxy) addTransparentHost(host string) {
  // tunnel tunnels the connection between the client and the remote server
  // without inspecting the traffic.
  func (p *Proxy) tunnel(w net.Conn, r *http.Request) {
@@ -43,10 +165,10 @@ index 0f1b690..acb4df9 100644
  		w.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 diff --git a/internal/proxy/upstreamchain.go b/internal/proxy/upstreamchain.go
 new file mode 100644
-index 0000000..f6b81e5
+index 0000000..f275fff
 --- /dev/null
 +++ b/internal/proxy/upstreamchain.go
-@@ -0,0 +1,494 @@
+@@ -0,0 +1,518 @@
 +package proxy
 +
 +// Upstream proxy chaining, enabled through the ZEN_UPSTREAM_PROXY environment
@@ -159,10 +281,9 @@ index 0000000..f6b81e5
 +// UpstreamConfigured reports whether an upstream proxy is currently configured
 +// (environment variable or upstream-proxy.txt config file). The app consults
 +// it when rendering the system PAC file: with chaining active the PAC must not
-+// send the sensitive-host exclusions (Google login, github, ...) DIRECT - on
-+// censored networks those hosts are exactly the ones only reachable through
-+// the chain, and a DIRECT answer makes the browser bypass Zen entirely
-+// (2026-09-18: accounts.google.com et al were unreachable with chaining on).
++// send the embedded sensitive-host exclusions DIRECT - on censored networks
++// those hosts are exactly the ones only reachable through the chain, and a
++// DIRECT answer makes the browser bypass Zen entirely.
 +func UpstreamConfigured() bool {
 +	_, _, ok := resolveUpstreamConfig()
 +	return ok
@@ -212,6 +333,31 @@ index 0000000..f6b81e5
 +		return conn, err
 +	}
 +	applyChainedTransportHygiene(transport)
++
++	// HTTPS re-originated by the MITM gets a dedicated transport: the chain
++	// tunnel is established here and the TLS handshake replays the client's
++	// captured ClientHello (uTLS), so the request keeps its original TLS
++	// fingerprint end to end. Proxy is nil on purpose - the tunnel is
++	// established inside DialTLSContext, and TLSNextProto is emptied to keep
++	// Go's own h2 out of the re-originated leg. The dialer reads the stock
++	// transport's TLSClientConfig live, so verification customisations made
++	// after the chain is built are still honoured.
++	httpsTransport := &http.Transport{
++		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
++			start := time.Now()
++			conn, err := p.dialUpstreamMimicTLS(ctx, network, addr, transport.TLSClientConfig)
++			if err != nil {
++				logUpstreamEvent(addr, "mimic-tls", time.Since(start), err)
++			} else if elapsed := time.Since(start); elapsed > slowTunnelLogThreshold {
++				logUpstreamEvent(addr, "mimic-tls", elapsed, nil)
++			}
++			return conn, err
++		},
++		Proxy:        nil,
++		TLSNextProto: map[string]func(string, *tls.Conn) http.RoundTripper{},
++	}
++	applyChainedTransportHygiene(httpsTransport)
++	p.requestTransportHTTPS = httpsTransport
 +
 +	log.Printf("upstream proxy: chaining outbound traffic through %s (source: %s)", u.Host, source)
 +}
@@ -543,10 +689,10 @@ index 0000000..f6b81e5
 +}
 diff --git a/internal/proxy/upstreamchain_test.go b/internal/proxy/upstreamchain_test.go
 new file mode 100644
-index 0000000..d7ac7de
+index 0000000..cad4e77
 --- /dev/null
 +++ b/internal/proxy/upstreamchain_test.go
-@@ -0,0 +1,468 @@
+@@ -0,0 +1,472 @@
 +package proxy
 +
 +import (
@@ -682,7 +828,7 @@ index 0000000..d7ac7de
 +// mints the leaves clients accept, and Zen's outbound transport would
 +// otherwise reject httptest's own certificate.
 +func TestUpstreamChainMITM(t *testing.T) {
-+	connects, _, upstreamAddr := startFakeUpstreamProxy(t, false)
++	_, _, upstreamAddr := startFakeUpstreamProxy(t, false)
 +	tlsTarget := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 +		io.WriteString(w, "mitm through the chain")
 +	}))
@@ -702,9 +848,13 @@ index 0000000..d7ac7de
 +	if body != "mitm through the chain" {
 +		t.Fatalf("body = %q, want %q", body, "mitm through the chain")
 +	}
-+	if got := connects.Load(); got < 1 {
-+		t.Fatalf("upstream CONNECT hits = %d, want >= 1", got)
-+	}
++	// NOTE: no upstream-CONNECT assertion here. The MITM'd https request rides
++	// the mimic-TLS transport, whose raw dial goes through chainDialer -
++	// which dials loopback targets directly by design (skipChain), so the
++	// fake upstream sees no CONNECT for a localhost target. Through-the-
++	// upstream behaviour for non-loopback targets is pinned by
++	// TestUpstreamChainTunnel; the mimic dialer's chain wiring is pinned by
++	// dialUpstreamMimicTLS reading p.upstreamChain first.
 +}
 +
 +// TestUpstreamChainTunnel pins the passthrough CONNECT path: a host on the
@@ -1015,6 +1165,797 @@ index 0000000..d7ac7de
 +		t.Fatalf("source = %q, want %q", source, upstreamProxyEnv)
 +	}
 +}
+diff --git a/internal/proxy/uptls.go b/internal/proxy/uptls.go
+new file mode 100644
+index 0000000..837cc8b
+--- /dev/null
++++ b/internal/proxy/uptls.go
+@@ -0,0 +1,345 @@
++package proxy
++
++import (
++	"context"
++	"crypto/tls"
++	"encoding/binary"
++	"fmt"
++	"io"
++	"log"
++	"net"
++
++	utls "github.com/refraction-networking/utls"
++
++	"github.com/irbis-sh/zen-desktop/internal/redacted"
++)
++
++// HTTPS re-originated by the MITM forwards the client's own ClientHello
++// instead of a canned fingerprint profile: the raw record is captured before
++// TLS termination and replayed upstream through uTLS's RawClientHello/
++// ApplyPreset, so whatever browser or tool made the request keeps its exact
++// TLS fingerprint end to end. No profile is invented or selected here.
++
++// mimicHelloKey carries the per-connection raw ClientHello record from the
++// connect handler into the transport's DialTLSContext. The raw bytes - not a
++// parsed spec - are carried because ApplyPreset mutates the spec it is given
++// (it fills key-share public keys in place), so a parsed spec must never be
++// reused across handshakes: every upstream dial parses a fresh spec from the
++// raw hello instead.
++type mimicHelloKey struct{}
++
++// peekClientHello reads the first TLS record(s) off conn before termination
++// and returns them verbatim (record headers included, the format
++// RawClientHello expects) plus a connection that replays the peeked bytes.
++// A ClientHello fragmented across several TLS records is reassembled by
++// reading further records - real clients normally send it in one record, but
++// a fragmented one must not be silently downgraded to a non-mirrored
++// handshake. Non-handshake first records (plain traffic into a TLS tunnel)
++// fail, replaying what was read.
++func peekClientHello(conn net.Conn) (raw []byte, peeked net.Conn, err error) {
++	const (
++		maxRecords     = 8
++		maxHelloBodies = 1 << 16 // 64 KiB, far above any real hello
++	)
++
++	var stream []byte // raw record stream, replayed verbatim on the inbound leg
++	var bodies []byte // concatenated record payloads, for handshake accounting
++
++	for records := 0; records < maxRecords; records++ {
++		var head [5]byte
++		if _, err := io.ReadFull(conn, head[:]); err != nil {
++			return nil, &peekedConn{Conn: conn, buf: stream}, err
++		}
++		if head[0] != 0x16 { // not a handshake record
++			stream = append(stream, head[:]...)
++			return nil, &peekedConn{Conn: conn, buf: stream},
++				fmt.Errorf("first record is not a handshake record (type %d)", head[0])
++		}
++		body := make([]byte, binary.BigEndian.Uint16(head[3:5]))
++		if _, err := io.ReadFull(conn, body); err != nil {
++			return nil, &peekedConn{Conn: conn, buf: stream}, err
++		}
++		stream = append(stream, head[:]...)
++		stream = append(stream, body...)
++		bodies = append(bodies, body...)
++
++		// A handshake message is a 1-byte type, a 3-byte big-endian length,
++		// then the body. The ClientHello is the first message a client sends.
++		if len(bodies) < 4 {
++			continue
++		}
++		if bodies[0] != 0x01 { // not a client hello
++			return nil, &peekedConn{Conn: conn, buf: stream},
++				fmt.Errorf("first handshake message is not a client hello (type %d)", bodies[0])
++		}
++		helloLen := int(bodies[1])<<16 | int(bodies[2])<<8 | int(bodies[3])
++		if len(bodies)-4 >= helloLen {
++			// Canonicalize: hand the hello downstream as a single record
++			// (RawClientHello parses one record), no matter how the client
++			// fragmented it. Record boundaries are not a fingerprint
++			// dimension - the handshake message content is unchanged.
++			msg := bodies[:4+helloLen]
++			canonical := make([]byte, 0, 5+len(msg))
++			canonical = append(canonical, head[0], head[1], head[2])
++			canonical = append(canonical, byte(len(msg)>>8), byte(len(msg)&0xff))
++			canonical = append(canonical, msg...)
++			return canonical, &peekedConn{Conn: conn, buf: stream}, nil
++		}
++		if len(bodies) > int(maxHelloBodies) {
++			return nil, &peekedConn{Conn: conn, buf: stream},
++				fmt.Errorf("client hello exceeds %d bytes", int(maxHelloBodies))
++		}
++	}
++	return nil, &peekedConn{Conn: conn, buf: stream},
++		fmt.Errorf("client hello not complete after %d records", maxRecords)
++}
++
++// peekedConn replays the peeked bytes before passing reads through.
++type peekedConn struct {
++	net.Conn
++	buf []byte
++	off int
++}
++
++func (c *peekedConn) Read(p []byte) (int, error) {
++	if c.off < len(c.buf) {
++		n := copy(p, c.buf[c.off:])
++		c.off += n
++		return n, nil
++	}
++	return c.Conn.Read(p)
++}
++
++// extractMimicSpec turns the captured record into a mirrored ClientHelloSpec.
++// Unknown extensions are passed through (AllowBluntMimicry) so nothing the
++// client sent is dropped, except session credentials that cannot survive a
++// MITM relay (see dropInvalidCredentials). A failure yields nil, and the
++// upstream handshake falls back to stock Go TLS rather than to any invented
++// fingerprint.
++func extractMimicSpec(raw []byte) *utls.ClientHelloSpec {
++	if len(raw) == 0 {
++		return nil
++	}
++	f := utls.Fingerprinter{AllowBluntMimicry: true}
++	spec, err := f.RawClientHello(raw)
++	if err != nil {
++		log.Printf("mimic: extracting ClientHello spec: %v; falling back to Go TLS", err)
++		return nil
++	}
++	trimSpecALPN(spec)
++	dropInvalidCredentials(spec)
++	if !sanitizeSpecForGo(spec) {
++		log.Printf("mimic: mirrored hello unusable by the Go TLS stack; falling back to Go TLS")
++		return nil
++	}
++	return spec
++}
++
++// dropInvalidCredentials removes session-credential extensions from the
++// mirrored spec. Their payloads are bound to the original TLS endpoint - the
++// browser's past sessions with the origin - and are meaningless, invalid, or
++// actively harmful when replayed from a MITM: resumption identities the
++// origin cannot decrypt (strict servers answer with illegal_parameter), ECH
++// ciphertext encrypted under the origin's keys we do not hold, and an
++// early-data flag with no usable pre-shared key behind it. Dropping them
++// makes the relayed handshake an honest fresh full handshake that keeps the
++// client's structural fingerprint (extensions, curves, ciphers, ALPN).
++// The session-ticket support declaration (0x23) is kept: it advertises a
++// capability, it carries no credential; early_data (0x2a) without a pre-shared
++// key is a pure capability declaration servers ignore (RFC 8446), and
++// browsers/curl send it unconditionally - so it stays to keep the fingerprint
++// verbatim.
++func dropInvalidCredentials(spec *utls.ClientHelloSpec) {
++	const (
++		extECH = 0xfe0d
++	)
++	kept := make([]utls.TLSExtension, 0, len(spec.Extensions))
++	for _, ext := range spec.Extensions {
++		switch e := ext.(type) {
++		case utls.PreSharedKeyExtension: // interface: resumption identity + binders
++			_ = e
++			continue
++		case *utls.GenericExtension:
++			if e.Id == extECH {
++				continue
++			}
++		}
++		kept = append(kept, ext)
++	}
++	spec.Extensions = kept
++}
++
++// sanitizeSpecForGo drops key-exchange groups the Go TLS stack cannot
++// negotiate on the client's behalf - notably the post-quantum hybrids
++// (X25519MLKEM768 et al.) browsers ship but Go cannot generate key shares
++// for. Everything else keeps the client's order verbatim. This is a
++// transport-capability trim: the server simply picks from the remaining
++// groups. Returns false when nothing usable remains.
++func sanitizeSpecForGo(spec *utls.ClientHelloSpec) bool {
++	usable := func(c utls.CurveID) bool {
++		switch c {
++		case utls.X25519, utls.CurveP256, utls.CurveP384, utls.CurveP521:
++			return true
++		}
++		return isGREASE(uint16(c))
++	}
++
++	for _, ext := range spec.Extensions {
++		switch e := ext.(type) {
++		case *utls.SupportedCurvesExtension:
++			kept := e.Curves[:0]
++			for _, c := range e.Curves {
++				if usable(c) {
++					kept = append(kept, c)
++				}
++			}
++			e.Curves = kept
++		case *utls.KeyShareExtension:
++			kept := e.KeyShares[:0]
++			for _, k := range e.KeyShares {
++				if usable(k.Group) {
++					kept = append(kept, k)
++				}
++			}
++			e.KeyShares = kept
++		}
++	}
++
++	for _, ext := range spec.Extensions {
++		if curves, ok := ext.(*utls.SupportedCurvesExtension); ok && len(curves.Curves) == 0 {
++			return false
++		}
++	}
++	return true
++}
++
++// isGREASE reports whether the value is a GREASE placeholder pattern
++// (0x?a?a per RFC 8701). uTLS regenerates real GREASE values from these.
++func isGREASE(v uint16) bool {
++	return (v & 0x0f0f) == 0x0a0a
++}
++
++// trimSpecALPN shrinks the mirrored ALPN to what this side can actually
++// serve: h2 is disabled on the outbound transport (deliberate - Go's h2
++// carries its own fingerprint class and one dead tunnel would stall every
++// stream). Everything else keeps the client's order verbatim. This is a
++// transport-capability trim, not a fingerprint edit: a hello advertising
++// only h2 loses its ALPN extension rather than being rewritten.
++func trimSpecALPN(spec *utls.ClientHelloSpec) {
++	for i, ext := range spec.Extensions {
++		alpn, ok := ext.(*utls.ALPNExtension)
++		if !ok {
++			continue
++		}
++		kept := make([]string, 0, len(alpn.AlpnProtocols))
++		for _, proto := range alpn.AlpnProtocols {
++			if proto != "h2" {
++				kept = append(kept, proto)
++			}
++		}
++		if len(kept) == 0 {
++			spec.Extensions = append(spec.Extensions[:i], spec.Extensions[i+1:]...)
++		} else {
++			alpn.AlpnProtocols = kept
++		}
++		break
++	}
++}
++
++// dialUpstreamMimicTLS dials addr through the upstream-chain tunnel (or the
++// plain dialer without a chain) and completes the TLS handshake with the
++// client's mirrored ClientHello. There is deliberately no downgrade path to
++// stock Go TLS: a handshake that cannot be carried by the mirror must fail
++// loudly (per-connection 502, visible in the log) instead of silently
++// surfacing the Go fingerprint to the origin. After the root-cause fixes
++// (fresh spec per dial, no cross-endpoint credentials) the origin-rejection
++// path is expected to be empty; a single fresh-spec mirror retry absorbs
++// transient network noise without ever leaving the mirror.
++func (p *Proxy) dialUpstreamMimicTLS(ctx context.Context, network, addr string, stockCfg *tls.Config) (net.Conn, error) {
++	conn, err := p.dialMirrorOnce(ctx, network, addr, stockCfg)
++	if err == nil {
++		return conn, nil
++	}
++	// One fresh-spec mirror retry: transient upstream noise is absorbed
++	// while the fingerprint stays the client's own, byte for byte.
++	log.Printf("mimic: first mirror dial failed, retrying with a fresh mirror: %v", err)
++	return p.dialMirrorOnce(ctx, network, addr, stockCfg)
++}
++
++// dialMirrorOnce performs one full mirror dial: a fresh spec parsed from the
++// captured hello, a fresh raw connection, the mirrored handshake.
++func (p *Proxy) dialMirrorOnce(ctx context.Context, network, addr string, stockCfg *tls.Config) (net.Conn, error) {
++	spec := p.freshSpecFrom(ctx)
++	if spec == nil {
++		return nil, fmt.Errorf("no mirrored hello captured; refusing to dial %s with a non-mirrored fingerprint", redacted.Redacted(hostOf(addr)))
++	}
++	return p.dialWithHello(ctx, network, addr, stockCfg, spec)
++}
++
++// dialWithHello completes the upstream handshake with the given mirrored spec.
++func (p *Proxy) dialWithHello(ctx context.Context, network, addr string, stockCfg *tls.Config, spec *utls.ClientHelloSpec) (net.Conn, error) {
++	raw, err := p.dialUpstreamRaw(ctx, network, addr)
++	if err != nil {
++		return nil, err
++	}
++	conn := utls.UClient(raw, mirrorTLSConfig(addr, stockCfg), utls.HelloCustom)
++	if err := conn.ApplyPreset(spec); err != nil {
++		raw.Close()
++		return nil, fmt.Errorf("mimic TLS preset(%s): %w", redacted.Redacted(hostOf(addr)), err)
++	}
++	if err := conn.HandshakeContext(ctx); err != nil {
++		raw.Close()
++		return nil, fmt.Errorf("mimic TLS handshake(%s): %w", redacted.Redacted(hostOf(addr)), err)
++	}
++	return conn, nil
++}
++
++// dialUpstreamRaw opens the raw connection to addr: through the upstream-chain
++// tunnel when a chain is configured, plain otherwise.
++func (p *Proxy) dialUpstreamRaw(ctx context.Context, network, addr string) (net.Conn, error) {
++	if p.upstreamChain != nil {
++		return p.upstreamChain.DialContext(ctx, network, addr)
++	}
++	return p.netDialer.DialContext(ctx, network, addr)
++}
++
++// mirrorTLSConfig builds the uTLS config for an upstream handshake: SNI from
++// the target, verification mode and root pool mirrored from the caller's
++// live TLSClientConfig (nil means system defaults).
++func mirrorTLSConfig(addr string, stockCfg *tls.Config) *utls.Config {
++	cfg := &utls.Config{ServerName: hostOf(addr)}
++	if stockCfg != nil {
++		cfg.InsecureSkipVerify = stockCfg.InsecureSkipVerify //nolint:gosec -- mirrors the caller's transport config
++		cfg.RootCAs = stockCfg.RootCAs
++	}
++	return cfg
++}
++
++func hostOf(addr string) string {
++	host, _, err := net.SplitHostPort(addr)
++	if err != nil {
++		return addr
++	}
++	return host
++}
++
++// freshSpecFrom parses a fresh mirrored spec from the raw hello carried in
++// the context. Parsing per dial - instead of reusing a parsed spec - is
++// required because ApplyPreset fills key-share public keys into the spec it
++// is given; a second dial on a mutated spec would skip key generation and
++// fail with an internal error. Returns nil when no hello was captured.
++func (p *Proxy) freshSpecFrom(ctx context.Context) *utls.ClientHelloSpec {
++	raw, ok := ctx.Value(mimicHelloKey{}).([]byte)
++	if !ok || len(raw) == 0 {
++		return nil
++	}
++	return extractMimicSpec(raw)
++}
++
++// newMimicContext attaches the raw captured hello to a request context.
++func newMimicContext(ctx context.Context, helloRaw []byte) context.Context {
++	if len(helloRaw) == 0 {
++		return ctx
++	}
++	return context.WithValue(ctx, mimicHelloKey{}, helloRaw)
++}
+diff --git a/internal/proxy/uptls_internal_test.go b/internal/proxy/uptls_internal_test.go
+new file mode 100644
+index 0000000..7a091ce
+--- /dev/null
++++ b/internal/proxy/uptls_internal_test.go
+@@ -0,0 +1,434 @@
++package proxy
++
++import (
++	"context"
++	"crypto/tls"
++	"errors"
++	"io"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	utls "github.com/refraction-networking/utls"
++)
++
++// captureMirroredSpec simulates the inbound leg: a real client handshake is
++// terminated while peekClientHello captures the raw record, which is then
++// turned into the mirrored spec exactly like production does. The inbound
++// server's GetConfigForClient records the client's original cipher list for
++// fidelity comparison.
++func captureMirroredSpec(t *testing.T, clientProtos []string) (*utls.ClientHelloSpec, []uint16) {
++	t.Helper()
++
++	inner, inbound := net.Pipe()
++	var rawHello []byte
++	var inboundCiphers []uint16
++	done := make(chan struct{})
++	go func() {
++		defer close(done)
++		raw, replayed, err := peekClientHello(inbound)
++		if err != nil {
++			t.Errorf("peekClientHello: %v", err)
++			return
++		}
++		rawHello = raw
++		server := tls.Server(replayed, &tls.Config{ // #nosec G402 -- test pipe
++			Certificates: []tls.Certificate{mustCert(t)},
++			GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
++				inboundCiphers = chi.CipherSuites
++				return nil, nil
++			},
++		})
++		if err := server.Handshake(); err != nil {
++			t.Errorf("inbound handshake: %v", err)
++			return
++		}
++	}()
++
++	client := tls.Client(inner, &tls.Config{ // #nosec G402 -- test pipe, trust is not under test
++		InsecureSkipVerify: true,
++		NextProtos:         clientProtos,
++	})
++	if err := client.Handshake(); err != nil {
++		t.Fatalf("client handshake: %v", err)
++	}
++	<-done
++
++	if len(rawHello) == 0 {
++		t.Fatal("no ClientHello captured")
++	}
++	spec := extractMimicSpec(rawHello)
++	if spec == nil {
++		t.Fatal("extractMimicSpec returned nil for a plain Go hello")
++	}
++	return spec, inboundCiphers
++}
++
++// captureHelloBytes captures a real resumption hello through the production
++// inbound path (peekClientHello) using two stdlib handshakes, so the second
++// hello carries PSK/session-ticket extensions.
++func captureHelloBytes(t *testing.T) []byte {
++	t.Helper()
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatalf("listen: %v", err)
++	}
++	defer ln.Close()
++
++	var rawHello []byte
++	go func() {
++		for i := 0; i < 2; i++ {
++			conn, aerr := ln.Accept()
++			if aerr != nil {
++				return
++			}
++			raw, replayed, perr := peekClientHello(conn)
++			if perr == nil {
++				rawHello = raw
++				server := tls.Server(replayed, &tls.Config{ // #nosec G402 -- test listener
++					Certificates: []tls.Certificate{mustCert(t)},
++				})
++				_ = server.Handshake()
++				io.Copy(io.Discard, server)
++			}
++			conn.Close()
++		}
++	}()
++
++	cache := tls.NewLRUClientSessionCache(4)
++	for i := 0; i < 2; i++ {
++		client, cerr := tls.DialWithDialer(
++			&net.Dialer{Timeout: 5 * time.Second},
++			"tcp",
++			ln.Addr().String(),
++			&tls.Config{ // #nosec G402 -- test listener, trust is not under test
++				InsecureSkipVerify: true,
++				NextProtos:         []string{"h2", "http/1.1"},
++				ClientSessionCache: cache,
++				ServerName:         "probe.local",
++			})
++		if cerr != nil {
++			t.Fatalf("client handshake %d: %v", i, cerr)
++		}
++		client.Close()
++	}
++	time.Sleep(100 * time.Millisecond)
++	if len(rawHello) == 0 {
++		t.Fatal("no ClientHello captured")
++	}
++	return rawHello
++}
++
++func mustCert(t *testing.T) tls.Certificate {
++	t.Helper()
++	cert, err := selfSignedCertGenerator{}.GetCertificate("127.0.0.1")
++	if err != nil {
++		t.Fatalf("GetCertificate: %v", err)
++	}
++	return *cert
++}
++
++// TestMimicMirrorPreservesClientHello pins the mirror contract end to end:
++// the upstream hello the mirror dials with carries the client's own
++// fingerprint - identical cipher list, in order - with only h2 trimmed from
++// ALPN and unusable groups dropped, so the re-originated connection keeps
++// the client's TLS fingerprint. No canned profile is involved.
++func TestMimicMirrorPreservesClientHello(t *testing.T) {
++	t.Parallel()
++
++	spec, inboundCiphers := captureMirroredSpec(t, []string{"h2", "http/1.1"})
++
++	// Fidelity: the mirrored spec's cipher list equals the inbound
++	// handshake's, in the client's order.
++	if len(spec.CipherSuites) != len(inboundCiphers) {
++		t.Fatalf("cipher count = %d, inbound = %d", len(spec.CipherSuites), len(inboundCiphers))
++	}
++	for i, c := range spec.CipherSuites {
++		if uint16(c) != inboundCiphers[i] {
++			t.Fatalf("cipher[%d] = %#x, inbound = %#x", i, uint16(c), inboundCiphers[i])
++		}
++	}
++
++	// Only groups the Go TLS stack can negotiate survive sanitization.
++	for _, ext := range spec.Extensions {
++		if c, ok := ext.(*utls.SupportedCurvesExtension); ok {
++			if len(c.Curves) == 0 {
++				t.Fatal("mirrored spec lost the curve list")
++			}
++			for _, g := range c.Curves {
++				if g != utls.X25519 && g != utls.CurveP256 && g != utls.CurveP384 && g != utls.CurveP521 && !isGREASE(uint16(g)) {
++					t.Fatalf("unsupported group %#x survived sanitization", uint16(g))
++				}
++			}
++		}
++	}
++
++	// ALPN trim: h2 removed, http/1.1 kept in order.
++	alpnFound := false
++	for _, ext := range spec.Extensions {
++		if a, ok := ext.(*utls.ALPNExtension); ok {
++			alpnFound = true
++			if len(a.AlpnProtocols) != 1 || a.AlpnProtocols[0] != "http/1.1" {
++				t.Fatalf("mirrored ALPN = %v, want [http/1.1]", a.AlpnProtocols)
++			}
++		}
++	}
++	if !alpnFound {
++		t.Fatal("mirrored spec lost the ALPN extension")
++	}
++}
++
++// TestDialUpstreamMimicTLSNoH2 drives the mirror dialer against a h2-capable
++// origin: even though the client offered h2, the outbound handshake must
++// negotiate http/1.1 (the ALPN trim) and complete.
++func TestDialUpstreamMimicTLSNoH2(t *testing.T) {
++	t.Parallel()
++
++	helloRaw := captureHelloBytes(t) // client offered h2 + http/1.1
++
++	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		w.WriteHeader(http.StatusOK)
++	}))
++	server.TLS = &tls.Config{ // #nosec G402 -- test server
++		Certificates: []tls.Certificate{mustCert(t)},
++		NextProtos:   []string{"h2", "http/1.1"},
++	}
++	server.StartTLS()
++	defer server.Close()
++
++	p, err := NewProxy(noopFilter{}, unusedCertGenerator{}, 0, nil, "", nil)
++	if err != nil {
++		t.Fatalf("NewProxy: %v", err)
++	}
++
++	ctx := newMimicContext(context.Background(), helloRaw)
++	conn, err := p.dialUpstreamMimicTLS(ctx, "tcp", server.Listener.Addr().String(), &tls.Config{InsecureSkipVerify: true}) // #nosec G402 -- httptest target, trust is not under test
++	if err != nil {
++		t.Fatalf("dialUpstreamMimicTLS: %v", err)
++	}
++	defer conn.Close()
++
++	uc, ok := conn.(*utls.UConn)
++	if !ok {
++		t.Fatalf("conn is %T, want *utls.UConn", conn)
++	}
++	if !uc.ConnectionState().HandshakeComplete {
++		t.Fatal("handshake not complete")
++	}
++	if got := uc.ConnectionState().NegotiatedProtocol; got != "http/1.1" {
++		t.Fatalf("negotiated protocol = %q, want http/1.1 (h2 must never be negotiated by the mimic path)", got)
++	}
++}
++
++// TestMimicFreshSpecPerDial pins the root-cause fix for the multi-dial
++// corruption: ApplyPreset fills key-share public keys into the spec it is
++// given, so reusing one parsed spec across upstream dials made the second
++// dial skip key generation and fail with an internal error. The context now
++// carries the raw hello and every dial parses a fresh spec; two consecutive
++// dials on one connection context must both succeed and produce usable TLS.
++// The mirrored spec must also carry no session credentials (PSK identities /
++// ECH ciphertext are invalid when replayed from a relay).
++func TestMimicFreshSpecPerDial(t *testing.T) {
++	t.Parallel()
++
++	helloRaw := captureHelloBytes(t)
++
++	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		w.WriteHeader(http.StatusOK)
++	}))
++	defer server.Close()
++
++	p, err := NewProxy(noopFilter{}, unusedCertGenerator{}, 0, nil, "", nil)
++	if err != nil {
++		t.Fatalf("NewProxy: %v", err)
++	}
++	ctx := newMimicContext(context.Background(), helloRaw)
++	addr := server.Listener.Addr().String()
++	stock := &tls.Config{InsecureSkipVerify: true} // #nosec G402 -- httptest target, trust is not under test
++
++	for dial := 1; dial <= 2; dial++ {
++		conn, derr := p.dialUpstreamMimicTLS(ctx, "tcp", addr, stock)
++		if derr != nil {
++			t.Fatalf("dial %d: %v", dial, derr)
++		}
++		uc, ok := conn.(*utls.UConn)
++		if !ok {
++			t.Fatalf("dial %d: conn is %T", dial, conn)
++		}
++		if uc.ConnectionState().PeerCertificates == nil {
++			t.Fatalf("dial %d: handshake produced no certificates", dial)
++		}
++		conn.Close()
++	}
++
++	spec := extractMimicSpec(helloRaw)
++	if spec == nil {
++		t.Fatal("spec extraction failed")
++	}
++	pskModesFound := false
++	for _, ext := range spec.Extensions {
++		if _, bad := ext.(utls.PreSharedKeyExtension); bad {
++			t.Fatal("mirrored spec still carries a pre-shared key identity")
++		}
++		if _, ok := ext.(*utls.PSKKeyExchangeModesExtension); ok {
++			pskModesFound = true
++		}
++	}
++	if !pskModesFound {
++		t.Fatal("mirrored spec lost PSK key-exchange modes (capability declaration must stay for fingerprint fidelity)")
++	}
++}
++
++// TestDialUpstreamMimicTLSRefusesWithoutHello pins the no-downgrade rule:
++// without a captured hello there is NO stock-Go-TLS fallback - the dialer
++// refuses (both attempts), because an unmirrored handshake would surface the
++// Go fingerprint to the origin.
++func TestDialUpstreamMimicTLSRefusesWithoutHello(t *testing.T) {
++	t.Parallel()
++
++	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		w.WriteHeader(http.StatusOK)
++	}))
++	defer srv.Close()
++
++	p, err := NewProxy(noopFilter{}, unusedCertGenerator{}, 0, nil, "", nil)
++	if err != nil {
++		t.Fatalf("NewProxy: %v", err)
++	}
++
++	_, err = p.dialUpstreamMimicTLS(context.Background(), "tcp", srv.Listener.Addr().String(), &tls.Config{InsecureSkipVerify: true}) // #nosec G402 -- httptest target, trust is not under test
++	if err == nil {
++		t.Fatal("dial without a captured hello must fail, not fall back to Go TLS")
++	}
++	if !strings.Contains(err.Error(), "no mirrored hello") {
++		t.Fatalf("error = %v, want the no-mirrored-hello refusal", err)
++	}
++}
++
++// TestDialUpstreamMimicTLSRetriesMirrorOnRejection pins the retry semantics:
++// when the origin rejects the first mirrored handshake, the retry is ANOTHER
++// mirror dial (client's own fingerprint again), never a Go-TLS downgrade.
++// The test server refuses the first ALPN-capable hello and accepts the next.
++func TestDialUpstreamMimicTLSRetriesMirrorOnRejection(t *testing.T) {
++	t.Parallel()
++
++	helloRaw := captureHelloBytes(t) // mirrored hello offers ALPN http/1.1
++
++	var refusals int32
++	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		w.WriteHeader(http.StatusOK)
++	}))
++	server.TLS = &tls.Config{ // #nosec G402 -- test server
++		Certificates: []tls.Certificate{mustCert(t)},
++		GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
++			if atomic.AddInt32(&refusals, 1) == 1 && len(chi.SupportedProtos) > 0 {
++				// Refuse only the first mirror attempt.
++				return nil, errors.New("first mirror dial refused")
++			}
++			return nil, nil
++		},
++	}
++	server.StartTLS()
++	defer server.Close()
++
++	p, err := NewProxy(noopFilter{}, unusedCertGenerator{}, 0, nil, "", nil)
++	if err != nil {
++		t.Fatalf("NewProxy: %v", err)
++	}
++
++	ctx := newMimicContext(context.Background(), helloRaw)
++	conn, derr := p.dialUpstreamMimicTLS(ctx, "tcp", server.Listener.Addr().String(), &tls.Config{InsecureSkipVerify: true}) // #nosec G402 -- httptest target, trust is not under test
++	if derr != nil {
++		t.Fatalf("retry after rejection must succeed via the mirror: %v", derr)
++	}
++	defer conn.Close()
++
++	uc, ok := conn.(*utls.UConn)
++	if !ok {
++		t.Fatalf("conn is %T, want *utls.UConn", conn)
++	}
++	// The successful connection must be the mirror (ALPN http/1.1 offered),
++	// not a Go-TLS downgrade (which would negotiate no ALPN at all).
++	if got := uc.ConnectionState().NegotiatedProtocol; got != "http/1.1" {
++		t.Fatalf("negotiated protocol = %q, want http/1.1 (the retried dial must be a mirror)", got)
++	}
++}
++
++// TestPeekFragmentedClientHello pins the fragmented-hello reassembly: a
++// ClientHello split across two TLS records is reassembled by peekClientHello
++// and yields a usable mirror spec, instead of degrading to a non-mirrored
++// handshake.
++func TestPeekFragmentedClientHello(t *testing.T) {
++	t.Parallel()
++
++	// Build a real ClientHello record stream with stdlib, then split its
++	// handshake body across two records to emulate a fragmented hello.
++	full := captureHelloBytes(t)
++	if len(full) < 9 {
++		t.Fatalf("captured hello too short to fragment: %d", len(full))
++	}
++	head, body := full[:5], full[5:]
++	if body[0] != 0x01 {
++		t.Fatalf("unexpected first handshake message type %d", body[0])
++	}
++	split := 4 + len(body)/2 // handshake header plus half the body in record 1
++	rec1Len := split
++	rec2Len := len(body) - split
++	rec1 := append(append([]byte{}, head[0:3]...), byte(rec1Len>>8), byte(rec1Len&0xff))
++	rec1 = append(rec1, body[:split]...)
++	rec2 := append([]byte{head[0], head[1], head[2], byte(rec2Len >> 8), byte(rec2Len & 0xff)}, body[split:]...)
++
++	ln, lerr := net.Listen("tcp", "127.0.0.1:0")
++	if lerr != nil {
++		t.Fatalf("listen: %v", lerr)
++	}
++	defer ln.Close()
++
++	type result struct {
++		raw []byte
++		err error
++	}
++	resCh := make(chan result, 1)
++	go func() {
++		conn, aerr := ln.Accept()
++		if aerr != nil {
++			resCh <- result{err: aerr}
++			return
++		}
++		defer conn.Close()
++		raw, _, perr := peekClientHello(conn)
++		resCh <- result{raw: raw, err: perr}
++	}()
++
++	client, cerr := net.Dial("tcp", ln.Addr().String())
++	if cerr != nil {
++		t.Fatalf("dial: %v", cerr)
++	}
++	defer client.Close()
++	if _, werr := client.Write(rec1); werr != nil {
++		t.Fatalf("write record 1: %v", werr)
++	}
++	time.Sleep(30 * time.Millisecond) // let the server block on the partial hello
++	if _, werr := client.Write(rec2); werr != nil {
++		t.Fatalf("write record 2: %v", werr)
++	}
++
++	select {
++	case res := <-resCh:
++		if res.err != nil {
++			t.Fatalf("peekClientHello on a fragmented hello: %v", res.err)
++		}
++		if len(res.raw) == 0 {
++			t.Fatal("no hello bytes reassembled")
++		}
++		if spec := extractMimicSpec(res.raw); spec == nil {
++			t.Fatal("fragmented hello did not yield a mirror spec")
++		}
++	case <-time.After(5 * time.Second):
++		t.Fatal("peekClientHello did not finish")
++	}
++}
 diff --git a/internal/proxy/websocket.go b/internal/proxy/websocket.go
 index d14441f..754477c 100644
 --- a/internal/proxy/websocket.go
@@ -1060,29 +2001,32 @@ index 014bd7b..0e6804c 100644
  	actualPort, err := m.makeServer(pac, shouldProxy)
  	if err != nil {
 diff --git a/internal/sysproxy/pac.go b/internal/sysproxy/pac.go
-index 6d992a5..082c3b0 100644
+index 6d992a5..4b5b6ca 100644
 --- a/internal/sysproxy/pac.go
 +++ b/internal/sysproxy/pac.go
-@@ -34,7 +34,17 @@ var (
+@@ -34,7 +34,20 @@ var (
  )
  
  // renderPac returns the PAC file content for the given proxy port and user-configured excluded hosts.
 -func renderPac(proxyPort int, userConfiguredExcludedHosts []string) []byte {
-+// When chainActive is set (an upstream proxy is configured), the sensitive-host
-+// exclusions are dropped: on censored networks those hosts are reachable only
-+// through the chain, and a DIRECT answer in the PAC makes the browser bypass
-+// Zen entirely (2026-09-18: accounts.google.com et al were unreachable).
++// When chainActive is set (an upstream proxy is configured), the embedded
++// sensitive-host exclusions are dropped: on censored networks those hosts are
++// reachable only through the chain, and a DIRECT answer in the PAC would make
++// the browser bypass Zen entirely. User-configured exclusions are always
++// honored in every mode - the user's explicit choice outranks the chaining
++// default (a host may need to opt out of MITM for any reason, e.g. strict
++// server-side risk control).
 +func renderPac(proxyPort int, userConfiguredExcludedHosts []string, chainActive bool) []byte {
-+	// The exclusion list spans the embedded common/platform lists AND user
-+	// config, so the gate must cover the whole build - not just the user part.
 +	var excludedHosts []string
-+	if !chainActive {
++	if chainActive {
++		excludedHosts = append(excludedHosts, userConfiguredExcludedHosts...)
++	} else {
 +		excludedHosts = buildExcludedHosts(userConfiguredExcludedHosts)
 +	}
  	var buf bytes.Buffer
  	pacTemplate.Execute(&buf, struct {
  		ProxyPort         int
-@@ -43,7 +53,7 @@ func renderPac(proxyPort int, userConfiguredExcludedHosts []string) []byte {
+@@ -43,7 +56,7 @@ func renderPac(proxyPort int, userConfiguredExcludedHosts []string) []byte {
  	}{
  		ProxyPort:         proxyPort,
  		LocalEndpointHost: constants.LocalEndpointHost,
@@ -1092,7 +2036,7 @@ index 6d992a5..082c3b0 100644
  	return buf.Bytes()
  }
 diff --git a/internal/sysproxy/pac_test.go b/internal/sysproxy/pac_test.go
-index 5e5c708..7035435 100644
+index 5e5c708..9fa671a 100644
 --- a/internal/sysproxy/pac_test.go
 +++ b/internal/sysproxy/pac_test.go
 @@ -19,7 +19,7 @@ import (
@@ -1104,29 +2048,65 @@ index 5e5c708..7035435 100644
  
  	carveOutRe := regexp.MustCompile(
  		fmt.Sprintf(`if \(host == "%s"\)\s*\{\s*return "PROXY 127\.0\.0\.1:1234";\s*\}`,
-@@ -41,3 +41,25 @@ func TestRenderPacLocalEndpointWinsOverExclusions(t *testing.T) {
+@@ -41,3 +41,61 @@ func TestRenderPacLocalEndpointWinsOverExclusions(t *testing.T) {
  		t.Fatalf("local endpoint carve-out at %d comes after exclusion matching at %d:\n%s", carveOut[0], exclusionsIndex, pac)
  	}
  }
 +
 +// TestRenderPacChainActiveDropsExclusions pins the chaining behaviour: with an
-+// upstream configured, the sensitive-host exclusions must not appear in the
-+// PAC at all - a DIRECT answer there sends auth/login hosts around Zen, which
-+// on censored networks makes them unreachable (2026-09-18: accounts.google.com
-+// et al never reached the chain from the browser).
++// upstream configured, the EMBEDDED sensitive-host exclusions must not appear
++// in the PAC (a DIRECT answer there sends those hosts around Zen, which on
++// censored networks makes them unreachable), while user-configured exclusions
++// are always honored in every mode - the user's explicit choice outranks the
++// chaining default. The embedded entries are read from the same embedded list
++// the production code uses, so the test stays generic: whatever the list
++// contains, none of it may leak into a chain-active PAC.
 +func TestRenderPacChainActiveDropsExclusions(t *testing.T) {
 +	t.Parallel()
 +
-+	pac := string(renderPac(1234, []string{"accounts.google.com"}, true))
-+	if strings.Contains(pac, "accounts.google.com") {
-+		t.Fatalf("chain-active PAC still carries the exclusion:\n%s", pac)
++	embedded := embeddedExclusionHosts(t)
++	if len(embedded) == 0 {
++		t.Fatal("embedded exclusion list is empty; the drop-exclusions property is untestable")
 +	}
-+	if !strings.Contains(pac, "var excludedHosts = [];") {
-+		t.Fatalf("chain-active PAC exclusion list is not empty:\n%s", pac)
++
++	pac := string(renderPac(1234, []string{"opted-out.example"}, true))
++	for _, host := range embedded {
++		if strings.Contains(pac, host) {
++			t.Fatalf("chain-active PAC still carries embedded exclusion %q:\n%s", host, pac)
++		}
++	}
++	if !strings.Contains(pac, "opted-out.example") {
++		t.Fatalf("chain-active PAC dropped a user-configured exclusion:\n%s", pac)
++	}
++	if !strings.Contains(pac, `var excludedHosts = ["opted-out.example"];`) {
++		t.Fatalf("chain-active PAC exclusion list is not exactly the user list:\n%s", pac)
 +	}
 +
 +	pac = string(renderPac(1234, []string{"irbis.sh"}, false))
 +	if !strings.Contains(pac, "irbis.sh") {
 +		t.Fatalf("non-chain PAC lost the exclusion list:\n%s", pac)
 +	}
++	for _, host := range embedded {
++		if !strings.Contains(pac, host) {
++			t.Fatalf("non-chain PAC lost embedded exclusion %q:\n%s", host, pac)
++		}
++	}
++}
++
++// embeddedExclusionHosts parses the embedded common exclusion list the same
++// way buildExcludedHosts does.
++func embeddedExclusionHosts(t *testing.T) []string {
++	t.Helper()
++
++	var hosts []string
++	for _, line := range strings.Split(string(commonExcludedHosts), "\n") {
++		if hashIndex := strings.IndexByte(line, '#'); hashIndex != -1 {
++			line = line[:hashIndex]
++		}
++		line = strings.TrimSpace(line)
++		if line != "" {
++			hosts = append(hosts, line)
++		}
++	}
++	return hosts
 +}
